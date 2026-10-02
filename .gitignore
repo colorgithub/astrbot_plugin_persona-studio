@@ -1,0 +1,13 @@
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 本地运行 / 测试产物
+data/
+*.db
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/

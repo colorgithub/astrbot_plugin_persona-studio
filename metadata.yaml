@@ -1,0 +1,6 @@
+name: astrbot_plugin_persona_studio # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: 人格工坊 # 用于展示的名字
+desc: 在对话中创建人格、随时切换人格、并调用 LLM 按你的要求修改人格。
+version: v1.0.3 # 插件版本号
+author: color # 作者
+repo: https://github.com/colorgithub/astrbot_plugin_persona-studio # 插件的仓库地址

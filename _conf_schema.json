@@ -1,0 +1,51 @@
+{
+  "manage_requires_admin": {
+    "description": "创建/修改/删除人格需要管理员权限",
+    "type": "bool",
+    "hint": "开启后，只有 AstrBot 管理员（admins_id 列表中的用户）才能新建、修改、删除人格；关闭则所有人可用。切换人格不受此开关限制。",
+    "default": true
+  },
+  "allow_private_chat_manage": {
+    "description": "私聊中允许非管理员管理人格",
+    "type": "bool",
+    "hint": "开启后，私聊场景下任何使用者都能创建/修改/删除人格（只影响自己的会话）；群聊仍需要管理员。仅在上一项开启时生效。",
+    "default": true
+  },
+  "use_llm_expand": {
+    "description": "创建人格时用 LLM 扩写描述",
+    "type": "bool",
+    "hint": "开启后，/人格创建 时会把你的简短描述交给当前会话使用的 LLM，扩写成结构完整的系统提示词；关闭则直接使用你输入的文字。指令中加 --raw 可临时跳过 LLM。",
+    "default": true
+  },
+  "persona_llm_provider": {
+    "description": "人格扩写/修改使用的模型",
+    "type": "string",
+    "hint": "留空（默认）= 使用当前会话正在使用的对话模型。/人格创建 的 LLM 扩写与 /人格修改 的重写都会改用这里选定的模型提供商（在「服务提供商」页里配置的模型）。适合用便宜模型聊天、用强模型写人格。若所选模型已被删除或禁用，会自动回退为当前会话模型并在日志里告警。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "auto_switch_after_create": {
+    "description": "创建人格后自动切换到该人格",
+    "type": "bool",
+    "hint": "开启后，新建人格成功即在本会话生效，可以马上聊天验证效果。",
+    "default": true
+  },
+  "max_show_length": {
+    "description": "提示词展示的最大字符数",
+    "type": "int",
+    "hint": "创建/修改/查看人格时回显系统提示词的最大长度，超出会截断，避免消息过长。取值范围 200-10000，默认 1500。",
+    "default": 1500
+  },
+  "enable_llm_tools": {
+    "description": "允许 LLM 读取人格（函数调用工具）",
+    "type": "bool",
+    "hint": "开启后注册 persona_list / persona_read / persona_current 三个只读工具：模型可自行列出全部人格、读取指定人格的完整提示词、确认自己当前的人格。关闭后模型无法读取人格提示词。",
+    "default": true
+  },
+  "llm_tool_max_chars": {
+    "description": "LLM 工具读取提示词的最大字符数",
+    "type": "int",
+    "hint": "persona_read / persona_current 返回提示词时的截断长度，避免超长人格撑爆上下文。取值范围 200-50000，默认 4000。",
+    "default": 4000
+  }
+}
