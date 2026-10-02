@@ -1,6 +1,24 @@
 name: astrbot_plugin_persona_studio # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: 人格工坊 # 用于展示的名字
-desc: 在对话中创建人格、随时切换人格、并调用 LLM 按你的要求修改人格。
+short_desc: 在聊天里创建人格、随时切换，并让 LLM 按你的要求改写人格 # （可选）紧凑 UI 使用的短描述
+desc: |
+  在聊天里就能养人格：**对话中新建人格 → 随时切换 → 不满意直接让 LLM 改**，同时注册只读的 LLM 工具，让模型自己读取人格。
+
+  - `/人格创建 <名称> <描述>`：描述由 LLM 扩写成完整系统提示词（加 `--raw` 可直接使用原文）
+  - `/人格切换 <名称>`：群聊 / 私聊各自独立，用「默认」还原
+  - `/人格修改 <名称> <要求>`：让 LLM 按你的要求重写；人格名打错时只提示、不会误改当前人格
+  - `/人格查看`、`/人格删除`：查看完整系统提示词与删除
+  - 配置 `persona_llm_provider` 可指定「人格扩写 / 修改使用的模型」，留空则跟随当前会话模型
+  - 三个只读 LLM 工具 `persona_list` / `persona_read` / `persona_current`：模型可自行列出、读取人格
+
+  新建的人格与 WebUI「人格」页面数据完全互通；无第三方依赖。
 version: v1.0.3 # 插件版本号
 author: color # 作者
 repo: https://github.com/colorgithub/astrbot_plugin_persona-studio # 插件的仓库地址
+social_link: https://github.com/colorgithub # （可选）作者主页
+tags: # （可选）插件市场分类与搜索标签
+  - persona
+  - system-prompt
+  - roleplay
+  - llm
+  - 人格
