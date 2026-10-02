@@ -122,3 +122,7 @@ python tests/test_integration.py     # 真实 PersonaManager + SQLite + SharedPr
 ## 依赖
 
 无第三方依赖，仅使用 AstrBot 内置接口（要求 AstrBot v4.x，已在 4.28.1 上验证）。
+
+## 许可证
+
+[MIT](LICENSE)
