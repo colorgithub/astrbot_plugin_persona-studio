@@ -22,11 +22,13 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_persona_studio"
-PLUGIN_VERSION = "1.0.4"
+PLUGIN_VERSION = "1.0.5"
 
 # ---------------------------------------------------------------- 常量
 
-#: 会话人格被显式置为「不启用任何人格」时使用的哨兵值（AstrBot 内部约定）
+#: 会话人格被显式置为「不启用任何人格」时使用的哨兵值。
+#: 已在 AstrBot v4.28.1 源码中核对：PersonaManager.resolve_selected_persona()
+#: 对该字面量做了显式分支（`if persona_id == "[%None]": pass`），必须与上游保持一致。
 NO_PERSONA = "[%None]"
 #: 不允许被普通指令占用 / 覆盖的人格名
 RESERVED_PERSONA_IDS = {"default", NO_PERSONA}
@@ -740,6 +742,7 @@ class PersonaStudioPlugin(Star):
         first = parts[0]
         target: str | None = None
         requirement = ""
+        used_default_alias = False
         if len(parts) > 1:
             try:
                 persona = await self._find_persona(first)
@@ -754,21 +757,41 @@ class PersonaStudioPlugin(Star):
             elif first.lower() in DEFAULT_ALIASES:
                 target = await self._default_persona_id(event.unified_msg_origin)
                 requirement = parts[1].strip()
+                used_default_alias = True
             elif self._looks_like_persona_id(first):
                 # 首 token 长得像人格名、库里却没有：多半是名字打错了。
                 # 只提示，不静默把它当成「改当前会话人格」，避免误改。
                 yield event.plain_result(await self._unknown_persona_hint(first))
                 return
-        if not requirement:
-            if len(parts) == 1 and (
-                first.lower() in CURRENT_ALIASES or first.lower() in DEFAULT_ALIASES
-            ):
+        else:
+            # 只有一个 token，两种可能：人格名漏写了修改要求，或整段就是修改要求。
+            # 必须先查库确认它是不是已存在的人格名：旧版本直接把它当成修改要求发给
+            # LLM，会把「/人格修改 诗人」误当成「按『诗人』重写当前会话人格」并写库。
+            try:
+                persona = await self._find_persona(first)
+            except Exception as exc:
+                yield event.plain_result(f"❌ 查询人格失败：{exc}")
+                return
+            if persona is not None:
+                # 名字存在但没写要求：只提示补全，绝不把它当作修改要求
+                yield event.plain_result(
+                    f"❌ 请说明要对人格「{first}」改什么。\n"
+                    f"用法：/人格修改 {first} <修改要求>\n"
+                    f"例如：/人格修改 {first} 说话更简洁一点\n"
+                    f"想改当前会话人格的话写：/人格修改 当前 {first}"
+                )
+                return
+            if first.lower() in CURRENT_ALIASES or first.lower() in DEFAULT_ALIASES:
                 # 只写了「当前」/「默认」，没有修改要求：别把别名本身当成要求发给 LLM
                 yield event.plain_result(
                     "❌ 请说明要改什么。用法：/人格修改 当前 <修改要求>"
                 )
                 return
-            # 没写人格名（整段没有空格分隔的名字）：整段都是修改要求，作用于当前会话人格
+            # 既不是人格名也不是别名：整段当修改要求，作用于当前会话人格（文档约定的简写）
+            requirement = raw_arg
+            target = None
+        if not requirement:
+            # 首 token 不像人格名（含句子标点等）：整段都是修改要求，作用于当前会话人格
             requirement = raw_arg
             target = None
         if target is None:
@@ -785,9 +808,15 @@ class PersonaStudioPlugin(Star):
             requirement = requirement[:MAX_RAW_INPUT_LEN]
 
         if not target or target == NO_PERSONA:
-            yield event.plain_result(
-                "❌ 当前会话没有生效的人格。请指定名称：/人格修改 <名称> <修改要求>。"
-            )
+            if used_default_alias:
+                yield event.plain_result(
+                    "❌ AstrBot 当前没有配置可修改的默认人格（全局默认是内置的「default」，"
+                    "不是自定义人格）。请指定人格名：/人格修改 <名称> <修改要求>。"
+                )
+            else:
+                yield event.plain_result(
+                    "❌ 当前会话没有生效的人格。请指定名称：/人格修改 <名称> <修改要求>。"
+                )
             return
 
         try:

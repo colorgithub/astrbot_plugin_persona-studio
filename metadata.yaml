@@ -12,7 +12,7 @@ desc: |
   - 三个只读 LLM 工具 `persona_list` / `persona_read` / `persona_current`：模型可自行列出、读取人格
 
   新建的人格与 WebUI「人格」页面数据完全互通；无第三方依赖。
-version: v1.0.4 # 插件版本号
+version: v1.0.5 # 插件版本号
 author: color # 作者
 repo: https://github.com/colorgithub/astrbot_plugin_persona-studio # 插件的仓库地址
 social_link: https://github.com/colorgithub # （可选）作者主页
