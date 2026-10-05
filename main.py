@@ -22,7 +22,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_NAME = "astrbot_plugin_persona_studio"
-PLUGIN_VERSION = "1.0.5"
+PLUGIN_VERSION = "1.0.6"
 
 # ---------------------------------------------------------------- 常量
 
@@ -30,16 +30,29 @@ PLUGIN_VERSION = "1.0.5"
 #: 已在 AstrBot v4.28.1 源码中核对：PersonaManager.resolve_selected_persona()
 #: 对该字面量做了显式分支（`if persona_id == "[%None]": pass`），必须与上游保持一致。
 NO_PERSONA = "[%None]"
-#: 不允许被普通指令占用 / 覆盖的人格名
+#: 不允许被普通指令占用 / 覆盖、也不允许删除的人格名
 RESERVED_PERSONA_IDS = {"default", NO_PERSONA}
 
 DEFAULT_ALIASES = {"默认", "default", "重置", "reset", "默认人格"}
 CURRENT_ALIASES = {"当前", "current", "本会话", "现在"}
 NONE_ALIASES = {"无", "none", "关闭", "不使用", "不启用", "空"}
+#: 与内置别名冲突的人格名。历史遗留的仍可正常使用 / 删除，但不再允许新建——
+#: 否则会出现「能建、能看、能改，就是切不过去」的死角（/人格切换 无 会被当成关闭人格）。
+ALIAS_PERSONA_NAMES = DEFAULT_ALIASES | CURRENT_ALIASES | NONE_ALIASES
+#: 破坏性操作的确认旗标，可出现在参数任意位置
+CONFIRM_FLAGS = {"--yes", "-y", "--confirm", "--确认"}
+#: 非管理员创建的人格 → 创建者 umo 的映射（scope=global），用于归属隔离
+OWNER_SP_KEY = "persona_studio_owners"
+#: 修改前的旧提示词备份（scope=global），供 /人格还原 回滚
+BACKUP_SP_KEY = "persona_studio_backup"
+#: 单个人格最多保留的备份份数
+MAX_BACKUPS = 20
 
 MAX_PERSONA_ID_LEN = 32
 MAX_RAW_INPUT_LEN = 2000
 MAX_SHOW_LEN = 1500
+#: /人格 列表默认最多显示多少条，避免人格多时刷屏
+MAX_LIST_ITEMS = 30
 #: 句子标点：首 token 里出现这些字符，基本可以断定整段是「修改要求」而不是人格名
 SENTENCE_PUNCTUATION = set("，。！？、；：（）【】《》“”‘’,.!?;:()[]{}~—…")
 #: LLM 工具读取单个人格提示词时的默认最大字符数
@@ -52,15 +65,17 @@ CMD_SWITCH = ("人格切换", "切换人格")
 CMD_SHOW = ("人格查看", "查看人格")
 CMD_EDIT = ("人格修改", "修改人格", "人格调整")
 CMD_DELETE = ("人格删除", "删除人格")
+CMD_RESTORE = ("人格还原", "还原人格", "人格回滚")
 
 USAGE = (
     "🎭 人格工坊指令：\n"
     "/人格 列出所有人格\n"
-    "/人格创建 <名称> <描述> 新建人格（描述会由 LLM 扩写成系统提示词）\n"
+    "/人格创建 <名称> <描述> 新建人格（描述会由 LLM 扩写；加 --raw 直接用原文）\n"
     "/人格切换 <名称> 切换当前会话人格（可用「默认」还原）\n"
     "/人格修改 <名称> <修改要求> 让 LLM 按你的要求重写人格（可写「当前」改本会话人格）\n"
     "/人格查看 [名称] 查看人格的系统提示词\n"
-    "/人格删除 <名称> 删除人格"
+    "/人格还原 <名称> 撤销上一次修改，恢复修改前的提示词\n"
+    "/人格删除 <名称> --yes 删除人格（必须带 --yes 确认）"
 )
 
 CREATE_SYSTEM_PROMPT = (
@@ -167,6 +182,11 @@ class PersonaStudioPlugin(Star):
         return max(200, min(int(value), 10000))
 
     @property
+    def _max_list_items(self) -> int:
+        value = self._get("max_list_items", MAX_LIST_ITEMS)
+        return max(5, min(int(value), 200))
+
+    @property
     def _persona_llm_provider_id(self) -> str:
         """配置里指定的「人格扩写/修改」模型 id；空字符串表示跟随当前会话模型。"""
         value = self._get("persona_llm_provider", "")
@@ -201,6 +221,11 @@ class PersonaStudioPlugin(Star):
             return f"人格名称太长（最多 {MAX_PERSONA_ID_LEN} 个字符）"
         if name in RESERVED_PERSONA_IDS or name.lower() in RESERVED_PERSONA_IDS:
             return f"「{name}」是保留名称，请换一个"
+        if name in ALIAS_PERSONA_NAMES or name.lower() in ALIAS_PERSONA_NAMES:
+            return (
+                f"「{name}」与内置别名冲突（「当前」「默认」「无」等），"
+                "会导致 /人格切换 永远切不到它，请换一个名字"
+            )
         if re.search(r"[\s/\\:*?\"<>|]", name):
             return "人格名称不能包含空格或 / \\ : * ? \" < > | 等字符"
         return None
@@ -215,6 +240,145 @@ class PersonaStudioPlugin(Star):
         if PersonaStudioPlugin._validate_persona_id(token) is not None:
             return False
         return not any(ch in SENTENCE_PUNCTUATION for ch in token)
+
+    # ------------------------------------------------------------ 文本 / 旗标
+
+    def _clip_preview(self, text: str) -> str:
+        """按 max_show_length 截断提示词，并显式标注已截断。
+
+        旧版本只有 /人格查看 会标注，/人格创建 与 /人格修改 的回执是静默截断的，
+        用户会以为看到的就是完整提示词。
+        """
+        text = text or ""
+        limit = self._max_show_length
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}\n……（已截断，完整提示词共 {len(text)} 字）"
+
+    @staticmethod
+    def _strip_confirm_flags(text: str) -> tuple[str, bool]:
+        """摘掉参数里的确认旗标，返回 (剩余文本, 是否带确认)。"""
+        confirmed = False
+        kept = []
+        for token in text.split():
+            if token.lower() in CONFIRM_FLAGS:
+                confirmed = True
+                continue
+            kept.append(token)
+        return " ".join(kept), confirmed
+
+    @staticmethod
+    def _strip_raw_flag(description: str) -> tuple[str, bool]:
+        """识别任意位置的 --raw（独立 token），返回 (去掉旗标后的描述, 是否命中)。
+
+        旧版本只认描述开头的 --raw，写在末尾会被当成正文写进人格。
+        """
+        if not re.search(r"(?:^|\s)--raw(?=\s|$)", description):
+            return description, False
+        cleaned = re.sub(r"(?:(?<=\s)|^)--raw(?=\s|$)", "", description, count=1)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        return cleaned, True
+
+    # ------------------------------------------------------------ 归属（非管理员隔离）
+
+    async def _load_owners(self) -> dict:
+        try:
+            data = await sp.global_get(OWNER_SP_KEY, {})
+        except Exception as exc:
+            logger.debug(f"读取人格归属失败（忽略）: {exc}")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _save_owners(self, owners: dict) -> None:
+        try:
+            await sp.global_put(OWNER_SP_KEY, owners)
+        except Exception as exc:
+            logger.warning(f"保存人格归属失败: {exc}")
+
+    async def _set_owner(self, persona_id: str, umo: str) -> None:
+        owners = await self._load_owners()
+        owners[persona_id] = umo
+        await self._save_owners(owners)
+
+    async def _drop_owner(self, persona_id: str) -> None:
+        owners = await self._load_owners()
+        if owners.pop(persona_id, None) is not None:
+            await self._save_owners(owners)
+
+    async def _check_persona_ownership(
+        self, event: AstrMessageEvent, persona_id: str
+    ) -> str | None:
+        """非管理员只能改 / 删自己创建的人格。允许时返回 None，否则返回错误说明。
+
+        管理员不受限制。由 WebUI 或管理员创建的人格没有归属记录，一律视为
+        「公共人格」，非管理员不能改 / 删——这样就不会出现「抢注名字」或
+        「误删别人的人格」。
+        """
+        if event.is_admin():
+            return None
+        owner = (await self._load_owners()).get(persona_id)
+        if owner is None:
+            return (
+                f"❌ 「{persona_id}」是公共人格（由管理员或 WebUI 创建），"
+                "你不能修改或删除它。\n"
+                "需要自己的版本的话，用 /人格创建 建一个你自己的。"
+            )
+        if owner != event.unified_msg_origin:
+            return f"❌ 「{persona_id}」是其他使用者创建的人格，你不能修改或删除它。"
+        return None
+
+    # ------------------------------------------------------------ 修改前备份（可回滚）
+
+    async def _backup_prompt(self, persona_id: str, prompt: str) -> None:
+        try:
+            backups = await sp.global_get(BACKUP_SP_KEY, {})
+            if not isinstance(backups, dict):
+                backups = {}
+            stack = backups.get(persona_id)
+            if not isinstance(stack, list):
+                stack = []
+            stack.append(prompt or "")
+            backups[persona_id] = stack[-MAX_BACKUPS:]
+            await sp.global_put(BACKUP_SP_KEY, backups)
+        except Exception as exc:
+            logger.warning(f"备份人格 {persona_id} 的旧提示词失败: {exc}")
+
+    async def _pop_backup(self, persona_id: str) -> str | None:
+        try:
+            backups = await sp.global_get(BACKUP_SP_KEY, {})
+            if not isinstance(backups, dict):
+                return None
+            stack = backups.get(persona_id)
+            if not isinstance(stack, list) or not stack:
+                return None
+            prompt = stack.pop()
+            if stack:
+                backups[persona_id] = stack
+            else:
+                backups.pop(persona_id, None)
+            await sp.global_put(BACKUP_SP_KEY, backups)
+            return prompt
+        except Exception as exc:
+            logger.warning(f"读取人格 {persona_id} 的备份失败: {exc}")
+            return None
+
+    async def _backup_count(self, persona_id: str) -> int:
+        try:
+            backups = await sp.global_get(BACKUP_SP_KEY, {})
+        except Exception:
+            return 0
+        if not isinstance(backups, dict):
+            return 0
+        stack = backups.get(persona_id)
+        return len(stack) if isinstance(stack, list) else 0
+
+    async def _drop_backups(self, persona_id: str) -> None:
+        try:
+            backups = await sp.global_get(BACKUP_SP_KEY, {})
+            if isinstance(backups, dict) and backups.pop(persona_id, None) is not None:
+                await sp.global_put(BACKUP_SP_KEY, backups)
+        except Exception as exc:
+            logger.debug(f"清理人格 {persona_id} 的备份失败（忽略）: {exc}")
 
     async def _all_personas(self) -> list:
         personas = await self.context.persona_manager.get_all_personas()
@@ -282,11 +446,21 @@ class PersonaStudioPlugin(Star):
             session_config = (
                 await sp.session_get(umo, "session_service_config", {}) or {}
             )
+            # 与 _current_persona_id 保持一致的防御：非 dict 时放弃清理，
+            # 不要让 AttributeError 被下面的 except 吞成一条看不见的 debug 日志。
+            if not isinstance(session_config, dict):
+                logger.warning(
+                    "session_service_config 不是 dict（实际 %s），跳过会话级人格清理",
+                    type(session_config).__name__,
+                )
+                session_config = {}
             if session_config.get("persona_id"):
                 session_config.pop("persona_id", None)
                 await sp.session_put(umo, "session_service_config", session_config)
         except Exception as exc:
-            logger.debug(f"清理会话级人格失败（忽略）: {exc}")
+            # 清理失败会让「切换人格」被会话级强制人格覆盖，表现为切换不生效，
+            # 这是最难排查的一类现象，因此用 warning 而非 debug。
+            logger.warning(f"清理会话级人格失败（本次切换可能不生效）: {exc}")
 
         conversation_id = await conversation_manager.get_curr_conversation_id(umo)
         if not conversation_id:
@@ -523,10 +697,18 @@ class PersonaStudioPlugin(Star):
 
         lines = ["🎭 可用人格："]
         if personas:
-            for persona in personas:
+            limit = self._max_list_items
+            shown = personas[:limit]
+            for persona in shown:
                 mark = "✅" if persona.persona_id == current else "•"
                 lines.append(
                     f"{mark} {persona.persona_id} — {brief_text(persona.system_prompt)}"
+                )
+            hidden = len(personas) - len(shown)
+            if hidden > 0:
+                lines.append(
+                    f"…… 还有 {hidden} 个人格未显示（最多显示 {limit} 个，"
+                    f"可用 /人格查看 <名称> 直接查看）"
                 )
         else:
             lines.append("（还没有自定义人格）")
@@ -582,11 +764,11 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result(f"❌ 查询人格失败：{exc}")
             return
 
-        # 是否用 LLM 扩写描述（--raw 可强制只用原文）
+        # 是否用 LLM 扩写描述（--raw 可强制只用原文，位置不限）
         use_llm = self._use_llm_expand
-        if description.startswith("--raw"):
+        description, has_raw = self._strip_raw_flag(description)
+        if has_raw:
             use_llm = False
-            description = description[len("--raw") :].strip()
         if not description:
             yield event.plain_result("❌ 描述不能为空。")
             return
@@ -618,6 +800,11 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result(f"❌ 创建人格「{name}」失败：{exc}")
             return
 
+        # 非管理员创建的人格记下归属：之后只有创建者本人（或管理员）能改 / 删，
+        # 避免任何私聊使用者都能动全局人格库。
+        if not event.is_admin():
+            await self._set_owner(name, event.unified_msg_origin)
+
         switched = False
         if self._auto_switch_after_create:
             try:
@@ -629,7 +816,7 @@ class PersonaStudioPlugin(Star):
         reply = [
             f"✅ 已创建人格「{name}」{llm_note}",
             "",
-            f"📝 系统提示词预览：\n{system_prompt[: self._max_show_length]}",
+            f"📝 系统提示词预览：\n{self._clip_preview(system_prompt)}",
             "",
         ]
         if switched:
@@ -656,17 +843,20 @@ class PersonaStudioPlugin(Star):
 
         target = raw_arg
         lowered = raw_arg.lower()
-        if lowered in DEFAULT_ALIASES:
-            target = await self._default_persona_id(event.unified_msg_origin)
-        elif lowered in NONE_ALIASES:
-            target = NO_PERSONA
-        else:
-            try:
-                exists = await self._find_persona(target)
-            except Exception as exc:
-                yield event.plain_result(f"❌ 查询人格失败：{exc}")
-                return
-            if not exists:
+        # 先查库：确实存在同名人格时，真实人格优先于内置别名。
+        # 否则历史上创建的名为「无」「关闭」「当前」的人格会永远切不过去。
+        try:
+            exists = await self._find_persona(target)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 查询人格失败：{exc}")
+            return
+
+        if exists is None:
+            if lowered in DEFAULT_ALIASES:
+                target = await self._default_persona_id(event.unified_msg_origin)
+            elif lowered in NONE_ALIASES:
+                target = NO_PERSONA
+            else:
                 ids = await self._persona_ids()
                 hint = "、".join(ids) if ids else "（暂无自定义人格）"
                 yield event.plain_result(
@@ -696,31 +886,65 @@ class PersonaStudioPlugin(Star):
     async def persona_show(self, event: AstrMessageEvent):
         """查看某个人格的完整系统提示词。"""
         raw_arg = self._arg_str(event, CMD_SHOW).strip()
+        lowered = raw_arg.lower()
         target = raw_arg
-        if not target or target.lower() in CURRENT_ALIASES:
+        persona = None
+
+        async def _find(pid):
+            """返回 (persona, 错误文本)。"""
+            try:
+                return await self._find_persona(pid), None
+            except Exception as exc:
+                return None, f"❌ 查询人格失败：{exc}"
+
+        # 1) 先按字面名查库：真实人格优先于内置别名
+        if target:
+            persona, err = await _find(target)
+            if err:
+                yield event.plain_result(err)
+                return
+
+        # 2) 没命中再按别名解析（「当前」/「默认」）
+        if persona is None and (not target or lowered in CURRENT_ALIASES):
             try:
                 target = await self._current_persona_id(event.unified_msg_origin)
             except Exception:
                 target = None
-        if not target or target == NO_PERSONA:
-            yield event.plain_result(
-                "❌ 当前会话没有生效的人格。用法：/人格查看 <名称>，或先 /人格切换。"
-            )
+            if target and target != NO_PERSONA:
+                persona, err = await _find(target)
+                if err:
+                    yield event.plain_result(err)
+                    return
+        elif persona is None and lowered in DEFAULT_ALIASES:
+            target = await self._default_persona_id(event.unified_msg_origin)
+            if target and target != NO_PERSONA:
+                persona, err = await _find(target)
+                if err:
+                    yield event.plain_result(err)
+                    return
+            else:
+                yield event.plain_result(
+                    "❌ AstrBot 当前没有配置可查看的默认人格（全局默认是内置的"
+                    "「default」，不是自定义人格）。用法：/人格查看 <名称>。"
+                )
+                return
+
+        # 3) 仍未命中：区分「会话没挂人格」与「名字写错」
+        if persona is None:
+            if not raw_arg or lowered in CURRENT_ALIASES:
+                yield event.plain_result(
+                    "❌ 当前会话没有生效的人格。用法：/人格查看 <名称>，或先 /人格切换。"
+                )
+            else:
+                yield event.plain_result(
+                    f"❌ 找不到人格「{target}」，用 /人格 查看现有列表。"
+                )
             return
 
-        try:
-            persona = await self._find_persona(target)
-        except Exception as exc:
-            yield event.plain_result(f"❌ 查询人格失败：{exc}")
-            return
-        if not persona:
-            yield event.plain_result(f"❌ 找不到人格「{target}」，用 /人格 查看现有列表。")
-            return
-
-        prompt = persona.system_prompt or ""
-        if len(prompt) > self._max_show_length:
-            prompt = prompt[: self._max_show_length] + "\n……（已截断）"
-        yield event.plain_result(f"🎭 人格「{persona.persona_id}」的系统提示词：\n\n{prompt}")
+        yield event.plain_result(
+            f"🎭 人格「{persona.persona_id}」的系统提示词：\n\n"
+            f"{self._clip_preview(persona.system_prompt or '')}"
+        )
 
     @filter.command(CMD_EDIT[0], alias=set(CMD_EDIT[1:]))
     async def persona_edit(self, event: AstrMessageEvent):
@@ -758,6 +982,11 @@ class PersonaStudioPlugin(Star):
                 target = await self._default_persona_id(event.unified_msg_origin)
                 requirement = parts[1].strip()
                 used_default_alias = True
+            elif first.lower() in NONE_ALIASES:
+                # 「无」「关闭」等是「不使用人格」的别名，不是人格名，
+                # 别让它们落进「整段当修改要求」的分支去改当前人格。
+                yield event.plain_result(await self._unknown_persona_hint(first))
+                return
             elif self._looks_like_persona_id(first):
                 # 首 token 长得像人格名、库里却没有：多半是名字打错了。
                 # 只提示，不静默把它当成「改当前会话人格」，避免误改。
@@ -786,6 +1015,10 @@ class PersonaStudioPlugin(Star):
                 yield event.plain_result(
                     "❌ 请说明要改什么。用法：/人格修改 当前 <修改要求>"
                 )
+                return
+            if first.lower() in NONE_ALIASES:
+                # 同理，「无」「关闭」是「不使用人格」的别名，不是修改要求
+                yield event.plain_result(await self._unknown_persona_hint(first))
                 return
             # 既不是人格名也不是别名：整段当修改要求，作用于当前会话人格（文档约定的简写）
             requirement = raw_arg
@@ -828,6 +1061,12 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result(f"❌ 找不到人格「{target}」，用 /人格 查看现有列表。")
             return
 
+        # 非管理员只能改自己创建的人格
+        deny = await self._check_persona_ownership(event, target)
+        if deny:
+            yield event.plain_result(deny)
+            return
+
         new_prompt, note = await self._llm_complete(
             event.unified_msg_origin,
             EDIT_SYSTEM_PROMPT,
@@ -843,6 +1082,7 @@ class PersonaStudioPlugin(Star):
             )
             return
 
+        old_prompt = persona.system_prompt or ""
         try:
             await self.context.persona_manager.update_persona(
                 target, system_prompt=new_prompt
@@ -852,13 +1092,90 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result(f"❌ 更新人格「{target}」失败：{exc}")
             return
 
+        # 更新成功后再记录旧版本，避免失败时留下无意义的备份
+        await self._backup_prompt(target, old_prompt)
+
         reply = (
             f"✅ 已按你的要求用 LLM 重写人格「{target}」。\n\n"
-            f"📝 新的系统提示词：\n{new_prompt[: self._max_show_length]}\n\n"
-            f"不满意可以继续 /人格修改 {target} <新的要求>。"
+            f"📝 新的系统提示词：\n{self._clip_preview(new_prompt)}\n\n"
+            f"不满意可以继续 /人格修改 {target} <新的要求>；"
+            f"改坏了用 /人格还原 {target} 恢复上一次的版本。"
         )
         if note:
             reply += f"\n⚠️ {note}"
+        yield event.plain_result(reply)
+
+    @filter.command(CMD_RESTORE[0], alias=set(CMD_RESTORE[1:]))
+    async def persona_restore(self, event: AstrMessageEvent):
+        """撤销上一次修改，恢复人格在上一次修改前的提示词。"""
+        if not await self._check_manage_permission(event):
+            yield event.plain_result("❌ 你没有修改人格的权限（需要管理员）。")
+            return
+
+        target = self._arg_str(event, CMD_RESTORE).strip()
+        if not target:
+            yield event.plain_result(
+                "用法：/人格还原 <名称>\n"
+                "恢复该人格上一次被 /人格修改 覆盖之前的提示词（可连续还原多步）。"
+            )
+            return
+        if target.lower() in CURRENT_ALIASES:
+            try:
+                target = await self._current_persona_id(event.unified_msg_origin)
+            except Exception as exc:
+                yield event.plain_result(f"❌ 读取当前人格失败：{exc}")
+                return
+        if not target or target == NO_PERSONA:
+            yield event.plain_result(
+                "❌ 当前会话没有生效的人格。请指定名称：/人格还原 <名称>。"
+            )
+            return
+
+        try:
+            persona = await self._find_persona(target)
+        except Exception as exc:
+            yield event.plain_result(f"❌ 查询人格失败：{exc}")
+            return
+        if not persona:
+            yield event.plain_result(f"❌ 找不到人格「{target}」。")
+            return
+
+        deny = await self._check_persona_ownership(event, target)
+        if deny:
+            yield event.plain_result(deny)
+            return
+
+        count = await self._backup_count(target)
+        if count == 0:
+            yield event.plain_result(
+                f"❌ 人格「{target}」没有可还原的历史版本"
+                "（只有经过 /人格修改 的人格才会留下备份）。"
+            )
+            return
+
+        prompt = await self._pop_backup(target)
+        if prompt is None:
+            yield event.plain_result(f"❌ 读取人格「{target}」的历史版本失败。")
+            return
+
+        try:
+            await self.context.persona_manager.update_persona(
+                target, system_prompt=prompt
+            )
+        except Exception as exc:
+            logger.error(f"还原人格 {target} 失败: {exc}")
+            # 还原失败就把备份放回去，别弄丢历史版本
+            await self._backup_prompt(target, prompt)
+            yield event.plain_result(f"❌ 还原人格「{target}」失败：{exc}")
+            return
+
+        remain = await self._backup_count(target)
+        reply = (
+            f"✅ 已把人格「{target}」还原到上一次修改前的版本。\n\n"
+            f"📝 当前系统提示词：\n{self._clip_preview(prompt)}"
+        )
+        if remain:
+            reply += f"\n\n（还可以继续还原 {remain} 步）"
         yield event.plain_result(reply)
 
     @filter.command(CMD_DELETE[0], alias=set(CMD_DELETE[1:]))
@@ -868,9 +1185,10 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result("❌ 你没有删除人格的权限（需要管理员）。")
             return
 
-        target = self._arg_str(event, CMD_DELETE).strip()
+        raw_arg = self._arg_str(event, CMD_DELETE).strip()
+        target, confirmed = self._strip_confirm_flags(raw_arg)
         if not target:
-            yield event.plain_result("用法：/人格删除 <名称>")
+            yield event.plain_result("用法：/人格删除 <名称> --yes")
             return
         if target in RESERVED_PERSONA_IDS or target.lower() in RESERVED_PERSONA_IDS:
             yield event.plain_result(f"❌ 「{target}」是保留人格，不能删除。")
@@ -885,12 +1203,31 @@ class PersonaStudioPlugin(Star):
             yield event.plain_result(f"❌ 找不到人格「{target}」。")
             return
 
+        deny = await self._check_persona_ownership(event, target)
+        if deny:
+            yield event.plain_result(deny)
+            return
+
+        # 删除不可恢复，必须显式确认
+        if not confirmed:
+            prompt = persona.system_prompt or ""
+            yield event.plain_result(
+                f"⚠️ 即将删除人格「{target}」，此操作不可恢复。\n"
+                f"提示词共 {len(prompt)} 字，摘要：{brief_text(prompt)}\n\n"
+                f"确认请发送：/人格删除 {target} --yes"
+            )
+            return
+
         try:
             await self.context.persona_manager.delete_persona(target)
         except Exception as exc:
             logger.error(f"删除人格 {target} 失败: {exc}")
             yield event.plain_result(f"❌ 删除人格「{target}」失败：{exc}")
             return
+
+        # 清理归属与备份记录，避免残留脏数据
+        await self._drop_owner(target)
+        await self._drop_backups(target)
 
         note = ""
         try:
